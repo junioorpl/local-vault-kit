@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# vault — local encrypted folder manager (macOS)
+# Wraps APFS sparse bundles + Keychain auto-unlock + LaunchAgent auto-mount.
+# Designed to coexist with FileVault, Obsidian vaults, and AI-agent file access.
+
+set -euo pipefail
+
+VAULT_KIT_DIR="${VAULT_KIT_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+VAULT_HOME="${VAULT_HOME:-$HOME/Vaults}"
+KEYCHAIN_SERVICE_PREFIX="local-vault-kit"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
+
+err() { printf '\033[31merr\033[0m %s\n' "$*" >&2; exit 1; }
+log() { printf '\033[32m::\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!!\033[0m %s\n' "$*" >&2; }
+
+require_macos() {
+  [[ "$(uname)" == "Darwin" ]] || err "macOS only (uses hdiutil + Keychain + launchd)"
+}
+
+usage() {
+  cat <<'EOF'
+vault — local encrypted folder manager
+
+USAGE
+  vault init <name> [--size SIZE]      Create encrypted sparse bundle
+  vault mount <name>                   Mount bundle (uses Keychain)
+  vault unmount <name>                 Eject bundle
+  vault status [name]                  Show mount state
+  vault migrate <name> <source-dir>    Move dir into vault, leave symlink
+  vault autounlock <name> --enable     Install LaunchAgent for login auto-mount
+  vault autounlock <name> --disable    Remove LaunchAgent
+  vault list                           List bundles in $VAULT_HOME
+  vault destroy <name>                 Remove bundle + Keychain entry + LaunchAgent
+
+ENV
+  VAULT_HOME    Where bundles live (default: ~/Vaults)
+
+EOF
+}
+
+bundle_path() { echo "$VAULT_HOME/$1.sparsebundle"; }
+mount_path()  { echo "/Volumes/$1"; }
+keychain_service() { echo "$KEYCHAIN_SERVICE_PREFIX:$1"; }
+plist_path()  { echo "$LAUNCH_AGENT_DIR/com.local-vault-kit.$1.plist"; }
+
+is_mounted() {
+  [[ -d "$(mount_path "$1")" ]] && mount | grep -q " on $(mount_path "$1") "
+}
+
+cmd_init() {
+  local name="${1:-}" size="100m"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --size) size="$2"; shift 2 ;;
+      *) err "unknown flag: $1" ;;
+    esac
+  done
+  [[ -n "$name" ]] || { usage; exit 1; }
+
+  mkdir -p "$VAULT_HOME"
+  local bundle; bundle="$(bundle_path "$name")"
+  [[ ! -e "$bundle" ]] || err "bundle exists: $bundle"
+
+  log "creating sparse bundle: $bundle (size=$size, AES-256)"
+  echo "Set a strong passphrase for the vault. You will type it once now."
+  echo "It will be saved in your macOS Keychain so auto-mount works without prompts."
+
+  local pw pw2
+  read -r -s -p "Passphrase: " pw; echo
+  read -r -s -p "Confirm:    " pw2; echo
+  [[ "$pw" == "$pw2" ]] || err "passphrases differ"
+  [[ ${#pw} -ge 12 ]] || err "passphrase too short (min 12 chars)"
+
+  printf '%s' "$pw" | hdiutil create \
+    -encryption AES-256 \
+    -stdinpass \
+    -size "$size" \
+    -fs "Case-sensitive APFS" \
+    -volname "$name" \
+    -type SPARSEBUNDLE \
+    -nospotlight \
+    "$bundle" >/dev/null
+  log "bundle created"
+
+  log "saving passphrase to Keychain (service=$(keychain_service "$name"))"
+  security delete-generic-password -s "$(keychain_service "$name")" -a "$USER" >/dev/null 2>&1 || true
+  security add-generic-password \
+    -s "$(keychain_service "$name")" \
+    -a "$USER" \
+    -w "$pw" \
+    -T /usr/bin/security \
+    -T "$(command -v hdiutil)"
+  unset pw pw2
+
+  log "mounting"
+  cmd_mount "$name"
+
+  echo
+  log "done. next steps:"
+  echo "  vault migrate $name <source-folder>     # move sensitive folders in"
+  echo "  vault autounlock $name --enable         # mount automatically at login"
+}
+
+cmd_mount() {
+  local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+  is_mounted "$name" && { log "already mounted at $(mount_path "$name")"; return 0; }
+
+  local bundle; bundle="$(bundle_path "$name")"
+  [[ -e "$bundle" ]] || err "no bundle at $bundle"
+
+  local pw
+  pw="$(security find-generic-password -s "$(keychain_service "$name")" -a "$USER" -w 2>/dev/null)" \
+    || err "no Keychain entry for $(keychain_service "$name") — run 'vault init' or store manually"
+
+  printf '%s' "$pw" | hdiutil attach \
+    -stdinpass \
+    -nobrowse \
+    -mountpoint "$(mount_path "$name")" \
+    "$bundle" >/dev/null
+  unset pw
+
+  log "mounted: $(mount_path "$name")"
+}
+
+cmd_unmount() {
+  local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+  is_mounted "$name" || { warn "not mounted"; return 0; }
+  hdiutil detach "$(mount_path "$name")" >/dev/null
+  log "unmounted: $name"
+}
+
+cmd_status() {
+  local name="${1:-}"
+  if [[ -n "$name" ]]; then
+    if is_mounted "$name"; then
+      log "$name: mounted at $(mount_path "$name")"
+    else
+      warn "$name: not mounted"
+    fi
+    return 0
+  fi
+  for b in "$VAULT_HOME"/*.sparsebundle; do
+    [[ -e "$b" ]] || { warn "no bundles in $VAULT_HOME"; return 0; }
+    local n; n="$(basename "$b" .sparsebundle)"
+    if is_mounted "$n"; then
+      printf '  \033[32mmounted\033[0m  %s -> %s\n' "$n" "$(mount_path "$n")"
+    else
+      printf '  \033[33mlocked \033[0m  %s\n' "$n"
+    fi
+  done
+}
+
+cmd_migrate() {
+  local name="${1:-}" src="${2:-}"
+  [[ -n "$name" && -n "$src" ]] || { usage; exit 1; }
+
+  is_mounted "$name" || cmd_mount "$name"
+  [[ -d "$src" ]] || err "source not a dir: $src"
+  [[ ! -L "$src" ]] || err "source is already a symlink: $src"
+
+  local mp; mp="$(mount_path "$name")"
+  local base; base="$(basename "$src")"
+  local dst="$mp/$base"
+
+  [[ ! -e "$dst" ]] || err "destination exists in vault: $dst"
+
+  log "copying $src -> $dst (rsync, preserving perms)"
+  rsync -a "$src/" "$dst/"
+
+  local backup="${src}.pre-vault-$(date +%Y%m%d-%H%M%S)"
+  log "moving original to: $backup (delete after verifying symlink works)"
+  mv "$src" "$backup"
+
+  ln -s "$dst" "$src"
+  log "symlinked: $src -> $dst"
+  warn "verify, then: rm -rf '$backup'"
+}
+
+cmd_autounlock() {
+  local name="${1:-}" action="${2:-}"
+  [[ -n "$name" && -n "$action" ]] || { usage; exit 1; }
+
+  local plist; plist="$(plist_path "$name")"
+  case "$action" in
+    --enable)
+      mkdir -p "$LAUNCH_AGENT_DIR"
+      sed -e "s|@@NAME@@|$name|g" \
+          -e "s|@@VAULT_BIN@@|$VAULT_KIT_DIR/bin/vault|g" \
+          -e "s|@@VAULT_HOME@@|$VAULT_HOME|g" \
+          "$VAULT_KIT_DIR/templates/com.local-vault-kit.plist.tpl" > "$plist"
+      launchctl unload "$plist" 2>/dev/null || true
+      launchctl load -w "$plist"
+      log "auto-mount enabled. plist: $plist"
+      ;;
+    --disable)
+      [[ -f "$plist" ]] || { warn "no plist at $plist"; return 0; }
+      launchctl unload "$plist" 2>/dev/null || true
+      rm -f "$plist"
+      log "auto-mount disabled"
+      ;;
+    *) err "use --enable or --disable" ;;
+  esac
+}
+
+cmd_list() {
+  mkdir -p "$VAULT_HOME"
+  local found=0
+  for b in "$VAULT_HOME"/*.sparsebundle; do
+    [[ -e "$b" ]] || continue
+    found=1
+    local n; n="$(basename "$b" .sparsebundle)"
+    local sz; sz="$(du -sh "$b" 2>/dev/null | awk '{print $1}')"
+    printf '  %-20s %6s   %s\n' "$n" "$sz" "$b"
+  done
+  [[ $found -eq 1 ]] || warn "no bundles in $VAULT_HOME"
+}
+
+cmd_destroy() {
+  local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+  warn "this will permanently delete bundle, Keychain entry, and LaunchAgent for: $name"
+  read -r -p "type the vault name to confirm: " confirm
+  [[ "$confirm" == "$name" ]] || err "aborted"
+
+  is_mounted "$name" && cmd_unmount "$name"
+  rm -rf "$(bundle_path "$name")"
+  security delete-generic-password -s "$(keychain_service "$name")" -a "$USER" >/dev/null 2>&1 || true
+  cmd_autounlock "$name" --disable >/dev/null 2>&1 || true
+  log "destroyed: $name"
+}
+
+require_macos
+case "${1:-}" in
+  init)        shift; cmd_init "$@" ;;
+  mount)       shift; cmd_mount "$@" ;;
+  unmount|umount) shift; cmd_unmount "$@" ;;
+  status)      shift; cmd_status "$@" ;;
+  migrate)     shift; cmd_migrate "$@" ;;
+  autounlock)  shift; cmd_autounlock "$@" ;;
+  list)        shift; cmd_list "$@" ;;
+  destroy)     shift; cmd_destroy "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) err "unknown command: $1 (try 'vault help')" ;;
+esac
